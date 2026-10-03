@@ -1,0 +1,77 @@
+name: PR review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      # The trusted base workflow never checks out or executes PR code
+      - name: Review through AgentKit Runtime
+        env:
+          RUNTIME_ENDPOINT: ${{ vars.AGENTKIT_CICD_ENDPOINT }}
+          RUNTIME_API_KEY: ${{ secrets.AGENTKIT_CICD_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PULL_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from urllib.parse import urlsplit
+          from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  return None
+
+          endpoint = os.environ["RUNTIME_ENDPOINT"]
+          if urlsplit(endpoint).scheme != "https":
+              raise SystemExit("Configure an HTTPS Runtime /invoke endpoint")
+          if not os.environ["RUNTIME_API_KEY"]:
+              raise SystemExit("Configure the Runtime API key secret")
+          payload = {
+              "repository": os.environ["REPOSITORY"],
+              "pull_number": int(os.environ["PULL_NUMBER"]),
+              "head_sha": os.environ["HEAD_SHA"],
+              "github_token": os.environ["GITHUB_TOKEN"],
+          }
+          request = Request(endpoint, data=json.dumps(payload).encode(), headers={
+              "Authorization": "Bearer " + os.environ["RUNTIME_API_KEY"],
+              "Content-Type": "application/json", "Accept": "text/event-stream",
+          })
+          completed = False
+          event = ""
+          with build_opener(NoRedirect()).open(request, timeout=60) as response:
+              for raw_line in response:
+                  line = raw_line.decode().strip()
+                  if line.startswith("event:"):
+                      event = line[6:].strip()
+                  elif line.startswith("data:") and event in {"result", "error"}:
+                      result = json.loads(line[5:])
+                      if event == "error":
+                          raise SystemExit(result["message"])
+                      data = result["data"]
+                      print(json.dumps(data))
+                      if data["head_sha"] != os.environ["HEAD_SHA"]:
+                          raise SystemExit("Review returned a different commit")
+                      if data["skipped_files"]:
+                          raise SystemExit("Partial review; see the PR review")
+                      completed = True
+          if not completed:
+              sys.exit("Runtime connection ended without a review result")
+          PY
